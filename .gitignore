@@ -1,0 +1,22 @@
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# Produced by knitr / R Markdown
+*.html
+*.pdf
+
+# R package build/check
+*.tar.gz
+*.Rcheck/
+
+# RStudio Connect / rsconnect
+rsconnect/
+
+# Temporary files
+*~
+*.swp
+*.tmp
+*.bak
+
