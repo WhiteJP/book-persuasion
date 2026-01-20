@@ -1,0 +1,792 @@
+---
+title: "Text Persuasion Experiment"
+subtitle: "Experiment analysis"
+date: "`r Sys.Date()`"
+author: "Josh White"
+execute:
+  warning: false
+  #cache: true
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    df_print: paged
+    code-fold: true
+    code-tools: true
+    code-link: true
+    self-contained: true
+    theme: flatly
+    linestretch: 1
+    fig-width: 5
+    fig-height: 3.5
+    fig-dpi: 300
+    fig-cap: true
+---
+
+```{r}
+#| label: setup
+#| echo: false
+#| warning: false
+
+# Load packages
+library(tidyverse) # data manipulation, ggplot
+library(jpw)
+library(lmerTest)
+library(lme4)
+
+
+ggplot2::theme_set(ggplot2::theme_bw())# Set theme for ggplot
+
+```
+
+## Wrangle Data
+
+```{r}
+d_raw <- jpw::read_csv_qualtrics(
+  jpw::dropbox_path("data", "soft_launch.csv"),
+  col_types = cols(attn_check = col_character())
+)
+```
+
+```{r}
+d_all <- d_raw %>%
+  # Text condition: Lewis/Brooks (federal workers) vs Haidt (happiness)
+  # Format condition: Full original vs LLM summary
+  mutate(
+    text = factor(
+      ifelse(lewis == 1, "Lewis", "Haidt"),
+      levels = c("Lewis", "Haidt")
+    ),
+    format = factor(
+      ifelse(full_piece == 1, "Full", "Summary"),
+      levels = c("Full", "Summary")
+    ),
+    condition = interaction(text, format, sep = "_"),
+
+    treated = !is.na(`lewis_full_p1_timer_First Click`) |
+      !is.na(`haidt_full_p1_timer_First Click`)
+  ) %>%
+
+  #attention checks
+  mutate(
+    attncheck1_passed = att_check == "3", #answer should be "3" (Somewhat disagree)
+    attncheck2_passed = attn_check == "4,5", #answer should be "4,5" (both options selected)
+    attncheck_passed = attncheck1_passed & attncheck2_passed
+  ) %>%
+
+  # outcomes
+  mutate(
+    mvs_pre = rowMeans(select(., matches("^mvs\\d+_pre$")), na.rm = TRUE),
+    mvs_post = rowMeans(select(., matches("^mvs\\d+_post$")), na.rm = TRUE),
+  ) %>%
+
+  #changes
+  mutate(
+    trust_irs_change = trust_irs_post_1 - trust_irs_pre_1, # IRS Trust
+    fav_irs_change = fav_irs_post_1 - fav_irs_pre_1, # Opinion/Favorability of IRS (1-7 scale)
+    agents_change = agents_post_1 - agents_pre_1, # Opinion of IRS agents (1-7 scale)
+    servants_change = servants_post_1 - servants_pre_1, # Perception of civil servants (1-7 scale)
+    enforce_change = enforce_post_1 - enforce_pre_1, # Opinion on IRS enforcement/resources (1-7 scale)
+    doge_change = doge_post_1 - doge_pre_1, # Approval of IRS workforce cuts / DOGE (1-7 scale)
+    trump_change = trump_post_1 - trump_pre_1,
+    mvs_change = mvs_post - mvs_pre
+  ) %>%
+
+  # Aggregate timing and click data for text reading, then simplify dataset
+  mutate(
+  # Total reading time (Page Submit = time on page in seconds)
+    text_total_time = rowSums(select(., matches("(lewis|haidt).*_timer_Page Submit$")), na.rm = TRUE),
+    text_total_clicks = rowSums(select(., matches("(lewis|haidt).*_timer_Click Count$")), na.rm = TRUE)
+  ) %>%
+  select(-matches("(lewis|haidt).*_timer_")) |>  #remove them now have aggregats
+  select(-c(rid, age, gender...548, hhi, ethnicity, education, political_party, region, zip))
+
+```
+
+## Overall Sample Sizes
+
+**Note**: This soft launch data only includes the "Full" text format condition (no AI summary condition yet).
+
+```{r}
+# d_treated: all participants who received treatment
+d_treated <- d_all |>
+  filter(treated)
+
+# d_itt: ITT sample (passed attention checks)
+d_itt <- d_treated |>
+  filter(attncheck_passed)
+
+# Alias for backwards compatibility
+d <- d_itt |>
+  filter(Finished == "1")
+
+# Compute sample sizes
+n_all <- nrow(d_all)
+n_treated <- nrow(d_treated)
+n_itt <- nrow(d_itt)
+n_final <- nrow(d)
+
+# Create summary table
+sample_table <- tibble::tibble(
+  Stage = c(
+    "Recruited",
+    "Treated",
+    "ITT (passed attention checks)",
+    "Finished"
+  ),
+  N = c(n_all, n_treated, n_itt, n_final)
+)
+
+# Print table
+sample_table |> gt::gt()
+
+# Sample sizes by condition
+d |>
+  count(text, format) |>
+  pivot_wider(names_from = format, values_from = n) |>
+  gt::gt()
+
+# Attention check breakdown
+d_treated |>
+  summarise(
+    total = n(),
+    passed_attn1 = sum(attncheck1_passed, na.rm = TRUE),
+    passed_attn2 = sum(attncheck2_passed, na.rm = TRUE),
+    passed_both = sum(attncheck_passed, na.rm = TRUE)
+  ) |>
+  gt::gt()
+```
+
+### Attrition Analysis
+
+Check whether attrition differs by condition. (from ITT, i.e., passes attention checks and gets treatment, to finishing survey)
+
+```{r}
+# Attrition matrix: compare treated vs ITT by condition
+attrition_matrix <- d_itt |>
+  count(condition) |>
+  left_join(
+    d |> count(condition),
+    by = "condition",
+    suffix = c("_pre", "_post")
+  ) |>
+  mutate(n_post = replace_na(n_post, 0)) |>  # handle conditions with 0 survivors
+
+  transmute(
+    condition,
+    dropped = n_pre - n_post,
+    stayed = n_post
+  ) |>
+  column_to_rownames("condition") |>
+  as.matrix()
+
+attrition_matrix
+
+# Chi-squared test for differential attrition
+chisq.test(attrition_matrix)
+```
+
+### Reading Time & Engagement
+
+Examine how long participants spent reading each text and their click behavior.
+
+```{r}
+# Helper function to format seconds as hours and minutes
+format_time <- function(seconds) {
+  hours <- floor(seconds / 3600)
+  mins <- floor((seconds %% 3600) / 60)
+  secs <- round(seconds %% 60)
+
+  if (hours > 0) {
+    sprintf("%dh %dm", hours, mins)
+  } else if (mins > 0) {
+    sprintf("%dm %ds", mins, secs)
+  } else {
+    sprintf("%ds", secs)
+  }
+}
+
+# Summary statistics by text condition
+time_summary <- d |>
+  group_by(text) |>
+  summarise(
+    n = n(),
+    mean_sec = mean(text_total_time, na.rm = TRUE),
+    sd_sec = sd(text_total_time, na.rm = TRUE),
+    median_sec = median(text_total_time, na.rm = TRUE),
+    mean_clicks = mean(text_total_clicks, na.rm = TRUE),
+    sd_clicks = sd(text_total_clicks, na.rm = TRUE)
+  ) |>
+  mutate(
+    Time = sprintf("%s (%s)", sapply(mean_sec, format_time), sapply(sd_sec, format_time)),
+    Median = sapply(median_sec, format_time),
+    Clicks = sprintf("%.1f (%.1f)", mean_clicks, sd_clicks)
+  ) |>
+  select(Text = text, N = n, `Time M (SD)` = Time, `Time Mdn` = Median, `Clicks M (SD)` = Clicks)
+
+# t-tests
+ttest_time <- broom::tidy(t.test(text_total_time ~ text, data = d))
+ttest_clicks <- broom::tidy(t.test(text_total_clicks ~ text, data = d))
+
+# Combined table with descriptives and t-tests
+time_summary |>
+  knitr::kable(caption = "Reading time and clicks by text condition")
+
+# t-test results table
+tibble(
+  Measure = c("Reading time", "Clicks"),
+  `Difference` = c(
+    format_time(abs(ttest_time$estimate1 - ttest_time$estimate2)),
+    sprintf("%.2f", abs(ttest_clicks$estimate1 - ttest_clicks$estimate2))
+  ),
+  `t` = c(ttest_time$statistic, ttest_clicks$statistic),
+  `df` = c(ttest_time$parameter, ttest_clicks$parameter),
+  `p` = c(ttest_time$p.value, ttest_clicks$p.value),
+  `95% CI` = c(
+    sprintf("[%s, %s]", format_time(ttest_time$conf.low), format_time(ttest_time$conf.high)),
+    sprintf("[%.2f, %.2f]", ttest_clicks$conf.low, ttest_clicks$conf.high)
+  )
+) |>
+  knitr::kable(digits = 3, caption = "t-tests comparing Lewis vs Haidt texts")
+```
+
+```{r}
+#| fig-cap: "Distribution of reading time by text condition"
+
+# Convert to minutes for plotting
+d <- d |>
+  mutate(text_total_time_min = text_total_time / 60)
+
+# Histogram of reading times (in minutes)
+ggplot(d, aes(x = text_total_time_min, fill = text)) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  facet_wrap(~text, ncol = 1) +
+  labs(
+    x = "Total reading time (minutes)",
+    y = "Count",
+    fill = "Text"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+## Main Analysis
+
+Primary dependent variables:
+
+1. **IRS/Federal Worker Attitudes** (all 1-7 scales):
+   - Trust in the IRS
+   - Opinion of the IRS
+   - Opinion of IRS agents
+   - Perception of civil servants
+   - Opinion on IRS resources
+   - Approval of IRS workforce cuts
+   - Approval of Trump administration
+
+2. **Material Values Scale**: Mean of 6-item Material Values Scale (Richins, 2004)
+
+### Analysis Functions
+
+```{r}
+# Simplified analysis for full-text only (no format comparison)
+# Uses: change_score ~ text_treat * pre_score_c
+persuasion_analysis_full_only <- function(
+  change_dv,      # change score variable name
+  pre_dv,         # pre-treatment variable name (for covariate)
+  data,           # data frame
+  label,          # label for output
+  text_treatment = "Lewis"  # which text is treatment?
+) {
+
+  # t-tests for pre-post change by text condition
+t_tests <- data %>%
+    dplyr::group_by(text) %>%
+    rstatix::t_test(as.formula(paste(change_dv, "~ 1")), mu = 0, alternative = "two.sided") %>%
+    rstatix::add_significance() %>%
+    dplyr::ungroup()
+
+  # Set up model data
+  data_model <- data %>%
+    dplyr::mutate(
+      text_treat = ifelse(text == text_treatment, 1, 0),
+      pre_score_c = .data[[pre_dv]] - mean(.data[[pre_dv]], na.rm = TRUE)
+    )
+
+  # Fit model: change_score ~ text_treat * pre_score_c
+  formula_str <- paste0(change_dv, " ~ text_treat * pre_score_c")
+  mod <- estimatr::lm_robust(as.formula(formula_str), data = data_model)
+  lm_mod <- stats::lm(as.formula(formula_str), data = data_model)
+
+  # Extract coefficients
+  coefs <- broom::tidy(mod, conf.int = TRUE)
+  text_coef <- coefs %>% filter(term == "text_treat")
+
+  # ATE
+  ate <- marginaleffects::avg_comparisons(
+    lm_mod,
+    variables = "text_treat",
+    vcov = "HC2"
+  )
+
+  # Pooled SD for standardized effect size
+  pooled_sd <- stats::sd(data[[change_dv]], na.rm = TRUE)
+
+  # Standardized effect size (ATE / pooled SD)
+  std_ate <- text_coef$estimate / pooled_sd
+
+  # Plot: empirical means by text
+  emp_summary <- data %>%
+    dplyr::group_by(text) %>%
+    dplyr::summarise(
+      n = dplyr::n(),
+      mean = mean(.data[[change_dv]], na.rm = TRUE),
+      se = stats::sd(.data[[change_dv]], na.rm = TRUE) / sqrt(n),
+      ci95 = 1.96 * se,
+      lo = mean - ci95,
+      hi = mean + ci95,
+      .groups = "drop"
+    )
+
+  emp_plot <- ggplot2::ggplot(emp_summary) +
+    ggplot2::geom_linerange(
+      ggplot2::aes(x = text, ymin = lo, ymax = hi),
+      linewidth = 0.7
+    ) +
+    ggplot2::geom_point(
+      ggplot2::aes(x = text, y = mean),
+      size = 2.2
+    ) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed") +
+    ggplot2::labs(
+      title = paste0("Change scores: ", label),
+      x = "Text",
+      y = "Change Score"
+    ) +
+    ggplot2::theme_bw()
+
+  list(
+    t_tests = t_tests,
+    model = mod,
+    lm_model = lm_mod,
+    coefs = coefs,
+    text_coef = text_coef,
+    ate = ate,
+    pooled_sd = pooled_sd,
+    std_ate = std_ate,
+    empirical_summary = emp_summary,
+    empirical_plot = emp_plot
+  )
+}
+
+# Full 2x2 analysis function (text * format * pre_score)
+persuasion_analysis <- function(
+  change_dv,      # change score variable name
+  pre_dv,         # pre-treatment variable name (for covariate)
+  data,           # data frame
+  label,          # label for output
+  text_treatment = "Lewis"  # which text is treatment?
+) {
+
+  # t-tests for pre-post change in each 2x2 cell
+  t_tests <- data %>%
+    dplyr::group_by(text, format) %>%
+    rstatix::t_test(as.formula(paste(change_dv, "~ 1")), mu = 0, alternative = "two.sided") %>%
+    rstatix::add_significance() %>%
+    dplyr::ungroup()
+
+  # Set up coding
+  data_model <- data %>%
+    dplyr::mutate(
+      text_treat = ifelse(text == text_treatment, 1, 0),
+      format_eff = ifelse(format == "Full", -0.5, 0.5),
+      pre_score_c = .data[[pre_dv]] - mean(.data[[pre_dv]], na.rm = TRUE)
+    )
+
+  # Fit model: change_score ~ text*format*pre_score
+  formula_str <- paste0(change_dv, " ~ text_treat * format_eff * pre_score_c")
+  mod <- estimatr::lm_robust(as.formula(formula_str), data = data_model)
+  lm_mod <- stats::lm(as.formula(formula_str), data = data_model)
+
+  # Extract coefficients
+  coefs <- broom::tidy(mod, conf.int = TRUE)
+  text_coef <- coefs %>% filter(term == "text_treat")
+  interaction_coef <- coefs %>% filter(term == "text_treat:format_eff")
+
+  # Format-specific contrasts if interaction is significant
+  contrasts_by_format <- NULL
+  if (!is.na(interaction_coef$p.value) && interaction_coef$p.value < 0.05) {
+    contrasts_by_format <- marginaleffects::avg_comparisons(
+      lm_mod,
+      variables = "text_treat",
+      by = "format",
+      newdata = "balanced",
+      vcov = "HC2"
+    )
+  }
+
+  # Predictions by condition
+  preds <- marginaleffects::predictions(
+    lm_mod,
+    by = c("text", "format"),
+    newdata = "balanced",
+    vcov = "HC2"
+  )
+
+  # ATE (text effect averaged across format)
+  ate <- marginaleffects::avg_comparisons(
+    lm_mod,
+    variables = "text_treat",
+    newdata = "balanced",
+    vcov = "HC2"
+  )
+
+  # Plot: empirical means by condition
+  emp_summary <- data %>%
+    dplyr::group_by(text, format) %>%
+    dplyr::summarise(
+      n = dplyr::n(),
+      mean = mean(.data[[change_dv]], na.rm = TRUE),
+      se = stats::sd(.data[[change_dv]], na.rm = TRUE) / sqrt(n),
+      ci95 = 1.96 * se,
+      lo = mean - ci95,
+      hi = mean + ci95,
+      .groups = "drop"
+    )
+
+  emp_plot <- ggplot2::ggplot(emp_summary) +
+    ggplot2::geom_linerange(
+      ggplot2::aes(x = format, ymin = lo, ymax = hi, color = text),
+      position = ggplot2::position_dodge(width = 0.5),
+      linewidth = 0.7
+    ) +
+    ggplot2::geom_point(
+      ggplot2::aes(x = format, y = mean, color = text),
+      position = ggplot2::position_dodge(width = 0.5),
+      size = 2.2
+    ) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed") +
+    ggplot2::labs(
+      title = paste0("Change scores: ", label),
+      x = "Format",
+      y = "Change Score",
+      color = "Text"
+    ) +
+    ggplot2::theme_bw()
+
+  list(
+    t_tests = t_tests,
+    model = mod,
+    lm_model = lm_mod,
+    coefs = coefs,
+    text_coef = text_coef,
+    interaction_coef = interaction_coef,
+    contrasts_by_format = contrasts_by_format,
+    predictions = preds,
+    ate = ate,
+    empirical_summary = emp_summary,
+    empirical_plot = emp_plot
+  )
+}
+```
+
+### IRS/Federal Worker Attitudes
+
+For these analyses, Lewis text (federal workers) is the treatment, Haidt text (happiness) is the control.
+
+```{r}
+# Trust in IRS
+irs_trust <- persuasion_analysis_full_only(
+  change_dv = "trust_irs_change",
+  pre_dv = "trust_irs_pre_1",
+  data = d,
+  label = "Trust in IRS",
+  text_treatment = "Lewis"
+)
+
+# Favorability/Opinion of IRS
+irs_fav <- persuasion_analysis_full_only(
+  change_dv = "fav_irs_change",
+  pre_dv = "fav_irs_pre_1",
+  data = d,
+  label = "Favorability of IRS",
+  text_treatment = "Lewis"
+)
+
+# Opinion of IRS agents
+irs_agents <- persuasion_analysis_full_only(
+  change_dv = "agents_change",
+  pre_dv = "agents_pre_1",
+  data = d,
+  label = "Opinion of IRS agents",
+  text_treatment = "Lewis"
+)
+
+# Perception of civil servants
+civil_servants <- persuasion_analysis_full_only(
+  change_dv = "servants_change",
+  pre_dv = "servants_pre_1",
+  data = d,
+  label = "Perception of civil servants",
+  text_treatment = "Lewis"
+)
+
+# Opinion on IRS enforcement/resources
+irs_enforce <- persuasion_analysis_full_only(
+  change_dv = "enforce_change",
+  pre_dv = "enforce_pre_1",
+  data = d,
+  label = "Opinion on IRS enforcement",
+  text_treatment = "Lewis"
+)
+
+# Approval of IRS workforce cuts (DOGE)
+doge_approval <- persuasion_analysis_full_only(
+  change_dv = "doge_change",
+  pre_dv = "doge_pre_1",
+  data = d,
+  label = "Approval of DOGE/IRS workforce cuts",
+  text_treatment = "Lewis"
+)
+
+# Approval of Trump administration
+trump_approval <- persuasion_analysis_full_only(
+  change_dv = "trump_change",
+  pre_dv = "trump_pre_1",
+  data = d,
+  label = "Approval of Trump administration",
+  text_treatment = "Lewis"
+)
+```
+
+### Material Values Scale
+
+For this analysis, Haidt text (happiness) is the treatment, Lewis text (federal workers) is the control.
+
+```{r}
+# Material Values Scale
+mvs <- persuasion_analysis_full_only(
+  change_dv = "mvs_change",
+  pre_dv = "mvs_pre",
+  data = d,
+  label = "Material Values Scale",
+  text_treatment = "Haidt"
+)
+```
+
+### Results Summary
+
+#### T-tests for Pre-Post Change
+
+Two-tailed t-tests to determine whether each DV change (post - pre) is ≠ 0, separately by text condition.
+
+```{r}
+library(knitr)
+library(kableExtra)
+
+# Combine all t-test results into one table
+all_analyses <- list(
+  irs_trust, irs_fav, irs_agents, civil_servants,
+  irs_enforce, doge_approval, trump_approval, mvs
+)
+
+all_labels <- c(
+  "Trust in IRS", "Favorability of IRS", "Opinion of IRS agents",
+  "Perception of civil servants", "Opinion on IRS enforcement",
+  "Approval of DOGE/IRS cuts", "Approval of Trump admin", "Material Values Scale"
+)
+
+# Extract and combine t-tests
+combined_ttests <- purrr::map2_dfr(all_analyses, all_labels, ~ {
+  .x$t_tests |>
+    mutate(DV = .y) |>
+    select(DV, text, n, statistic, df, p, p.signif)
+})
+
+# Pivot to wide format for cleaner display
+ttest_wide <- combined_ttests |>
+  pivot_wider(
+    id_cols = DV,
+    names_from = text,
+    values_from = c(n, statistic, p, p.signif),
+    names_glue = "{text}_{.value}"
+  ) |>
+  mutate(
+    Lewis = sprintf("%.2f %s", Lewis_statistic, Lewis_p.signif),
+    Haidt = sprintf("%.2f %s", Haidt_statistic, Haidt_p.signif)
+  ) |>
+  select(DV,
+         `Lewis n` = Lewis_n, `Lewis t (sig)` = Lewis,
+         `Haidt n` = Haidt_n, `Haidt t (sig)` = Haidt)
+
+ttest_wide |>
+  knitr::kable(caption = "T-tests for pre-post change by text condition") |>
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+#### ATE Estimation
+
+ATE estimation with `text * pre_score` model (Lin estimator).
+
+```{r}
+library(broom)
+library(gt)
+
+# Function to create summary table for ATE results (full-only version)
+make_ate_table_full_only <- function(analyses, labels) {
+  sigstars <- function(p) {
+    ifelse(is.na(p), "",
+           ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01,  "**",
+                         ifelse(p < 0.05,  "*",
+                                ifelse(p < 0.1,   ".", "")))))
+  }
+
+  results <- purrr::map2_dfr(analyses, labels, ~ {
+    tibble(
+      DV = .y,
+      ATE = .x$text_coef$estimate,
+      SE = .x$text_coef$std.error,
+      p = .x$text_coef$p.value,
+      CI_low = .x$text_coef$conf.low,
+      CI_high = .x$text_coef$conf.high,
+      std_ate = .x$std_ate
+    )
+  }) %>%
+    mutate(
+      ATE_formatted = sprintf("%.3f (%.3f)%s", ATE, SE, sigstars(p)),
+      CI_formatted = sprintf("[%.3f, %.3f]", CI_low, CI_high),
+      std_ate_formatted = sprintf("%.3f", std_ate)
+    ) %>%
+    select(DV, ATE_formatted, std_ate_formatted, CI_formatted, p)
+
+  results %>%
+    gt() %>%
+    cols_label(
+      ATE_formatted = "ATE (SE)",
+      std_ate_formatted = "Std. ATE",
+      CI_formatted = "95% CI",
+      p = "p-value"
+    ) %>%
+    fmt_number(columns = p, decimals = 3) %>%
+    tab_footnote(
+      footnote = ". p < .10, * p < .05, ** p < .01, *** p < .001. Std. ATE = ATE / pooled SD."
+    )
+}
+
+# IRS DVs
+irs_analyses <- list(
+  irs_trust,
+  irs_fav,
+  irs_agents,
+  civil_servants,
+  irs_enforce,
+  doge_approval,
+  trump_approval
+)
+
+irs_labels <- c(
+  "Trust in IRS",
+  "Favorability of IRS",
+  "Opinion of IRS agents",
+  "Perception of civil servants",
+  "Opinion on IRS enforcement",
+  "Approval of DOGE/IRS cuts",
+  "Approval of Trump administration"
+)
+
+make_ate_table_full_only(irs_analyses, irs_labels)
+
+# Material Values Scale
+make_ate_table_full_only(list(mvs), "Material Values Scale")
+```
+
+### Graphs
+
+Empirical means with 95% CIs for each outcome measure.
+
+```{r}
+library(patchwork)
+
+# IRS DVs
+irs_trust$empirical_plot
+irs_fav$empirical_plot
+irs_agents$empirical_plot
+civil_servants$empirical_plot
+irs_enforce$empirical_plot
+doge_approval$empirical_plot
+trump_approval$empirical_plot
+
+# Material Values Scale
+mvs$empirical_plot
+```
+
+## Power Analysis
+
+Using the pilot data, we calculate the required total sample size for 80% power (α = .05, two-tailed) for each outcome measure. We show sample sizes for both the observed effect and a conservative estimate of half the observed effect.
+
+Since we use the Lin estimator (`change ~ treatment * pre_score_c`), which includes the interaction term, we base our power calculations directly on the observed standard errors from the model fits. The SE scales as 1/√n, so we can extrapolate the required sample size for a target effect. For 80% power with α = .05 (two-tailed), we need effect/SE ≈ 2.8.
+
+```{r}
+# Power calculation using actual Lin estimator SE
+# SE scales as 1/sqrt(n), so: SE_target = SE_pilot * sqrt(n_pilot / n_target)
+# For 80% power (two-tailed, α=.05): effect / SE = 2.8
+# Solving: n_target = n_pilot * (2.8 * SE_pilot / effect_target)²
+
+n_pilot <- nrow(d)
+critical_value <- qnorm(0.975) + qnorm(0.80)  # ≈ 2.8
+
+# Function to calculate required N based on observed SE
+calc_n_from_se <- function(effect, se, n_pilot, effect_multiplier = 1) {
+  if (is.na(effect) || is.na(se) || effect == 0) return(NA)
+  effect_target <- abs(effect) * effect_multiplier
+  n_target <- n_pilot * (critical_value * se / effect_target)^2
+  return(ceiling(n_target))
+}
+
+# Collect results from all analyses
+power_results <- tibble(
+  Outcome = c(
+    "Trust in IRS", "Favorability of IRS", "Opinion of IRS agents",
+    "Perception of civil servants", "Opinion on IRS enforcement",
+    "Approval of DOGE/IRS cuts", "Approval of Trump admin", "Material Values Scale"
+  ),
+  effect = c(
+    irs_trust$text_coef$estimate, irs_fav$text_coef$estimate, irs_agents$text_coef$estimate,
+    civil_servants$text_coef$estimate, irs_enforce$text_coef$estimate,
+    doge_approval$text_coef$estimate, trump_approval$text_coef$estimate, mvs$text_coef$estimate
+  ),
+  se = c(
+    irs_trust$text_coef$std.error, irs_fav$text_coef$std.error, irs_agents$text_coef$std.error,
+    civil_servants$text_coef$std.error, irs_enforce$text_coef$std.error,
+    doge_approval$text_coef$std.error, trump_approval$text_coef$std.error, mvs$text_coef$std.error
+  ),
+  std_ate = c(
+    irs_trust$std_ate, irs_fav$std_ate, irs_agents$std_ate,
+    civil_servants$std_ate, irs_enforce$std_ate,
+    doge_approval$std_ate, trump_approval$std_ate, mvs$std_ate
+  )
+) |>
+  mutate(
+    # N for same effect as observed
+    N_observed = map2_dbl(effect, se, ~calc_n_from_se(.x, .y, n_pilot, 1)),
+    # N for half the observed effect
+    N_half = map2_dbl(effect, se, ~calc_n_from_se(.x, .y, n_pilot, 0.5))
+  )
+
+# Display table
+power_results |>
+  mutate(
+    `Std. Effect (d)` = sprintf("%.3f", std_ate),
+    `N (observed)` = N_observed,
+    `N (half effect)` = N_half
+  ) |>
+  select(Outcome, `Std. Effect (d)`, `N (observed)`, `N (half effect)`) |>
+  gt::gt() |>
+  gt::tab_header(
+    title = "Required Sample Size for 80% Power",
+    subtitle = "Lin estimator, α = .05, two-tailed"
+  ) |>
+  gt::tab_footnote(
+    footnote = sprintf("Based on pilot N = %d. 'Half effect' assumes 50%% of the pilot effect in the main study.", n_pilot)
+  )
+```
