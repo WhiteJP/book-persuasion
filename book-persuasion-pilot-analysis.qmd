@@ -33,6 +33,8 @@ library(tidyverse) # data manipulation, ggplot
 library(jpw)
 library(lmerTest)
 library(lme4)
+library(corrplot) # for correlation matrix visualization
+library(ggrepel) # for text labels in plots
 
 
 ggplot2::theme_set(ggplot2::theme_bw())# Set theme for ggplot
@@ -789,4 +791,285 @@ power_results |>
   gt::tab_footnote(
     footnote = sprintf("Based on pilot N = %d. 'Half effect' assumes 50%% of the pilot effect in the main study.", n_pilot)
   )
+```
+
+## Structure of Lewis Outcome Measures (Pre-Treatment)
+
+This section examines the structure of the IRS/federal worker attitude measures at baseline (pre-treatment) using a correlation matrix and Principal Component Analysis (PCA). This helps us understand how tightly these measures hang together and whether they form distinct factors.
+
+### Pre-Treatment Measures
+
+The seven outcome variables measured before treatment:
+
+1. **Trust in IRS**: How much do you trust the IRS to act in the best interests of the American public?
+2. **Opinion of the IRS**: Overall, how favorable is your opinion of the IRS? (1 = Very unfavorable, 7 = Very favorable)
+3. **Opinion of IRS agents**: Overall, how favorable is your opinion of IRS agents? (1 = Very unfavorable, 7 = Very favorable)
+4. **Perception of civil servants**: Most career civil servants are… (1 = Self-serving bureaucrats, 7 = Dedicated public servants)
+5. **Opinion on IRS resources**: How much do you agree with the following statement? It is important for the IRS to have resources to enforce tax laws against wealthy tax evaders. (1 = Strongly disagree, 7 = Strongly agree)
+6. **Approval of IRS workforce cuts**: The Trump administration, via the Department of Government Efficiency (DOGE), has reduced the IRS workforce by over 25%. How do you feel about this policy? (1 = Strongly disapprove, 7 = Strongly approve)
+7. **Approval of Trump administration**: Do you approve of the Trump administration? (1 = Strongly disapprove, 7 = Strongly approve)
+
+### Correlation Matrix
+
+```{r}
+#| label: correlation-matrix
+#| fig-cap: "Correlation matrix of pre-treatment IRS/federal worker attitude measures"
+#| fig-width: 7
+#| fig-height: 6
+
+library(corrplot)
+
+# Select pre-treatment variables
+pre_vars <- d |>
+  select(
+    `Trust in IRS` = trust_irs_pre_1,
+    `Opinion of IRS` = fav_irs_pre_1,
+    `Opinion of IRS agents` = agents_pre_1,
+    `Civil servants` = servants_pre_1,
+    `IRS enforcement` = enforce_pre_1,
+    `DOGE approval` = doge_pre_1,
+    `Trump approval` = trump_pre_1
+  )
+
+# Compute correlation matrix
+cor_matrix <- cor(pre_vars, use = "pairwise.complete.obs")
+
+# Display correlation matrix as table
+cor_matrix |>
+  round(2) |>
+  as.data.frame() |>
+  tibble::rownames_to_column("Variable") |>
+  gt::gt() |>
+  gt::tab_header(title = "Correlation Matrix: Pre-Treatment Measures") |>
+  gt::fmt_number(columns = -Variable, decimals = 2)
+
+# Visualize correlation matrix
+corrplot(
+  cor_matrix,
+  method = "color",
+  type = "upper",
+  order = "hclust",
+  addCoef.col = "black",
+  number.cex = 0.7,
+  tl.col = "black",
+  tl.srt = 45,
+  tl.cex = 0.8,
+  col = colorRampPalette(c("#67001F", "#B2182B", "#D6604D", "#F4A582",
+                           "#FDDBC7", "#FFFFFF", "#D1E5F0", "#92C5DE",
+                           "#4393C3", "#2166AC", "#053061"))(200),
+  title = "",
+  mar = c(0, 0, 1, 0)
+)
+```
+
+### Principal Component Analysis
+
+```{r}
+#| label: pca-analysis
+#| fig-cap: "PCA of pre-treatment IRS/federal worker attitude measures"
+
+# Remove rows with missing values for PCA
+pre_vars_complete <- na.omit(pre_vars)
+
+# Run PCA with scaling
+pca_result <- prcomp(pre_vars_complete, scale. = TRUE, center = TRUE)
+
+# Summary of PCA
+summary(pca_result)
+
+# Eigenvalues and variance explained
+eigenvalues <- pca_result$sdev^2
+var_explained <- eigenvalues / sum(eigenvalues)
+cum_var <- cumsum(var_explained)
+
+# Create scree plot data
+scree_data <- tibble(
+
+PC = paste0("PC", 1:length(eigenvalues)),
+  Eigenvalue = eigenvalues,
+  `Variance Explained` = var_explained * 100,
+  `Cumulative Variance` = cum_var * 100
+) |>
+  mutate(PC = factor(PC, levels = PC))
+
+# Display variance table
+scree_data |>
+  mutate(
+    Eigenvalue = round(Eigenvalue, 3),
+    `Variance Explained` = sprintf("%.1f%%", `Variance Explained`),
+    `Cumulative Variance` = sprintf("%.1f%%", `Cumulative Variance`)
+  ) |>
+  gt::gt() |>
+  gt::tab_header(title = "PCA Variance Explained")
+```
+
+```{r}
+#| label: scree-plot
+#| fig-cap: "Scree plot showing eigenvalues and cumulative variance explained"
+#| fig-width: 8
+#| fig-height: 4
+
+library(patchwork)
+
+# Scree plot (eigenvalues)
+p_scree <- ggplot(scree_data, aes(x = PC, y = Eigenvalue)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  geom_line(aes(group = 1), linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Eigenvalue"
+  ) +
+  theme_bw() +
+  annotate("text", x = 6.5, y = 1.15, label = "Kaiser criterion (λ = 1)",
+           color = "red", size = 3)
+
+# Cumulative variance plot
+p_cumvar <- ggplot(scree_data, aes(x = PC, y = `Cumulative Variance`)) +
+  geom_col(fill = "darkorange", alpha = 0.7) +
+  geom_line(aes(group = 1), linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 80, linetype = "dashed", color = "red") +
+  labs(
+    title = "Cumulative Variance Explained",
+    x = "Principal Component",
+    y = "Cumulative Variance (%)"
+  ) +
+  theme_bw() +
+  scale_y_continuous(limits = c(0, 100))
+
+p_scree + p_cumvar
+```
+
+### Component Loadings
+
+```{r}
+#| label: pca-loadings
+#| fig-cap: "PCA component loadings"
+#| fig-width: 8
+#| fig-height: 5
+
+# Extract loadings
+loadings_df <- as.data.frame(pca_result$rotation) |>
+  tibble::rownames_to_column("Variable") |>
+  as_tibble()
+
+# Display loadings table (first 3 components)
+loadings_df |>
+  select(Variable, PC1, PC2, PC3) |>
+  mutate(across(starts_with("PC"), ~round(., 3))) |>
+  gt::gt() |>
+  gt::tab_header(title = "PCA Loadings (First 3 Components)") |>
+  gt::tab_footnote(
+    footnote = "Loadings show correlation between each variable and the principal component."
+  )
+
+# Visualize loadings as heatmap
+loadings_long <- loadings_df |>
+  pivot_longer(-Variable, names_to = "Component", values_to = "Loading") |>
+  mutate(Component = factor(Component, levels = paste0("PC", 1:7)))
+
+ggplot(loadings_long, aes(x = Component, y = Variable, fill = Loading)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", Loading)), size = 3) +
+  scale_fill_gradient2(
+    low = "#B2182B", mid = "white", high = "#2166AC",
+    midpoint = 0, limits = c(-1, 1)
+  ) +
+  labs(
+    title = "PCA Loadings Heatmap",
+    x = "Principal Component",
+    y = "Variable"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 0))
+```
+
+### Biplot
+
+```{r}
+#| label: pca-biplot
+#| fig-cap: "PCA biplot showing observations and variable loadings"
+#| fig-width: 7
+#| fig-height: 6
+
+library(ggrepel)
+
+# Get scores
+scores_df <- as.data.frame(pca_result$x) |>
+  tibble::rownames_to_column("id")
+
+# Get loadings scaled for plotting
+loading_scale <- 3  # Scale factor for arrows
+loadings_plot <- loadings_df |>
+  mutate(
+    PC1_scaled = PC1 * loading_scale,
+    PC2_scaled = PC2 * loading_scale
+  )
+
+# Biplot
+ggplot() +
+  # Observations
+  geom_point(
+    data = scores_df,
+    aes(x = PC1, y = PC2),
+    alpha = 0.5, color = "gray50"
+  ) +
+  # Variable arrows
+  geom_segment(
+    data = loadings_plot,
+    aes(x = 0, y = 0, xend = PC1_scaled, yend = PC2_scaled),
+    arrow = arrow(length = unit(0.2, "cm")),
+    color = "steelblue", linewidth = 0.8
+  ) +
+  # Variable labels
+  geom_text_repel(
+    data = loadings_plot,
+    aes(x = PC1_scaled, y = PC2_scaled, label = Variable),
+    color = "steelblue", size = 3.5,
+    box.padding = 0.5
+  ) +
+  labs(
+    title = "PCA Biplot",
+    x = sprintf("PC1 (%.1f%% variance)", var_explained[1] * 100),
+    y = sprintf("PC2 (%.1f%% variance)", var_explained[2] * 100)
+  ) +
+  theme_bw() +
+  coord_equal()
+```
+
+### Summary
+
+```{r}
+#| label: pca-summary
+#| results: asis
+
+# Calculate key statistics for summary
+n_components_kaiser <- sum(eigenvalues >= 1)
+var_pc1 <- var_explained[1] * 100
+var_pc2 <- var_explained[2] * 100
+var_2comp <- cum_var[2] * 100
+
+# Check if DOGE and Trump load together
+doge_trump_pc1_same_sign <- sign(loadings_df$PC1[loadings_df$Variable == "DOGE approval"]) ==
+                             sign(loadings_df$PC1[loadings_df$Variable == "Trump approval"])
+
+# Average absolute correlation
+avg_abs_cor <- mean(abs(cor_matrix[lower.tri(cor_matrix)]))
+
+cat(sprintf("
+**Key Findings:**
+- **Kaiser criterion**: %d component(s) have eigenvalue ≥ 1
+- **PC1** explains %.1f%% of variance; **PC1 + PC2** explain %.1f%%
+- **Average absolute correlation** among measures: %.2f
+- The measures %s tightly correlated overall
+",
+n_components_kaiser,
+var_pc1,
+var_2comp,
+avg_abs_cor,
+ifelse(avg_abs_cor > 0.5, "are moderately to", ifelse(avg_abs_cor > 0.3, "are weakly to moderately", "are not"))
+))
 ```
