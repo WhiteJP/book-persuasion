@@ -1,0 +1,823 @@
+---
+title: "Book Persuasion Experiment: Soft Launch Monitoring"
+subtitle: "Data collection quality checks and preregistered analysis"
+date: "`r Sys.Date()`"
+author: "Josh White"
+execute:
+  warning: false
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    df_print: paged
+    code-fold: true
+    code-tools: true
+    code-link: true
+    self-contained: true
+    theme: flatly
+    linestretch: 1
+    fig-width: 5
+    fig-height: 3.5
+    fig-dpi: 300
+    fig-cap: true
+---
+
+```{r}
+#| label: setup
+#| echo: false
+#| warning: false
+
+# Load packages
+library(tidyverse)
+library(jpw)
+library(estimatr)
+library(marginaleffects)
+library(rstatix)
+library(gt)
+library(knitr)
+library(kableExtra)
+library(patchwork)
+
+ggplot2::theme_set(ggplot2::theme_bw())
+```
+
+# Data Collection Monitoring
+
+## Data Wrangling
+
+```{r}
+#| label: load-data
+
+d_raw <- jpw::read_csv_qualtrics(
+ jpw::dropbox_path("data", "Opinion on Federal Workers_February 2, 2026_20.30.csv"),
+ col_types = cols(attn_check = col_character())
+) |>
+ # Remove pilot data (before Jan 27, 2026)
+ filter(StartDate >= as.POSIXct("2026-01-27"))
+```
+
+```{r}
+#| label: wrangle-data
+
+d_all <- d_raw %>%
+ # Text condition: Lewis/Brooks (federal workers) vs Haidt (happiness)
+ # Format condition: Full original vs LLM summary
+ mutate(
+   text = factor(
+     ifelse(lewis == 1, "Lewis", "Haidt"),
+     levels = c("Lewis", "Haidt")
+   ),
+   format = factor(
+     ifelse(full_piece == 1, "Full", "Summary"),
+     levels = c("Full", "Summary")
+   ),
+   condition = interaction(text, format, sep = "_"),
+
+   # Flag for being assigned to treatment (has condition assignment)
+   treated = !is.na(lewis) | !is.na(full_piece)
+ ) %>%
+
+ # Attention checks
+ mutate(
+   attncheck1_passed = att_check == "3",
+   attncheck2_passed = attn_check == "4,5",
+   attncheck_passed = attncheck1_passed & attncheck2_passed
+ ) %>%
+
+ # Create composite measures per preregistration
+ # IRS approval composite: trust_irs, fav_irs, agents (3 items)
+ mutate(
+   irs_approval_pre = rowMeans(
+     select(., trust_irs_pre_1, fav_irs_pre_1, agents_pre_1),
+     na.rm = TRUE
+   ),
+   irs_approval_post = rowMeans(
+     select(., trust_irs_post_1, fav_irs_post_1, agents_post_1),
+     na.rm = TRUE
+   )
+ ) %>%
+
+ # Civil service approval composite: servants + fav_cs (2 items)
+ mutate(
+   civil_service_pre = rowMeans(
+     select(., servants_pre_1, fav_cs_pre_1),
+     na.rm = TRUE
+   ),
+   civil_service_post = rowMeans(
+     select(., servants_post_1, fav_cs_post_1),
+     na.rm = TRUE
+   )
+ ) %>%
+
+ # Material Values Scale composite
+ mutate(
+   mvs_pre = rowMeans(select(., matches("^mvs\\d+_pre$")), na.rm = TRUE),
+   mvs_post = rowMeans(select(., matches("^mvs\\d+_post$")), na.rm = TRUE)
+ ) %>%
+
+ # Change scores for all DVs
+ mutate(
+   # Composites
+   irs_approval_change = irs_approval_post - irs_approval_pre,
+   civil_service_change = civil_service_post - civil_service_pre,
+
+   # Individual IRS-related measures
+   trust_irs_change = trust_irs_post_1 - trust_irs_pre_1,
+   fav_irs_change = fav_irs_post_1 - fav_irs_pre_1,
+   agents_change = agents_post_1 - agents_pre_1,
+   servants_change = servants_post_1 - servants_pre_1,
+   enforce_change = enforce_post_1 - enforce_pre_1,
+   doge_change = doge_post_1 - doge_pre_1,
+   trump_change = trump_post_1 - trump_pre_1,
+
+   # SSA agents favorability
+   fav_ssa_change = fav_ssa_post_1 - fav_ssa_pre_1,
+
+   # Material Values Scale
+   mvs_change = mvs_post - mvs_pre
+ ) %>%
+
+ # Aggregate timing data for text reading
+ mutate(
+   text_total_time = rowSums(
+     select(., matches("(lewis|haidt).*_timer_Page Submit$")),
+     na.rm = TRUE
+   ),
+   text_total_clicks = rowSums(
+     select(., matches("(lewis|haidt).*_timer_Click Count$")),
+     na.rm = TRUE
+   )
+ ) %>%
+ select(-matches("(lewis|haidt).*_timer_"))
+```
+
+## Sample Flow
+
+```{r}
+#| label: sample-sizes
+
+# Define analysis samples
+# Flow:
+# 1. Started survey (some quit before att check 1)
+# 2. Passed attention check 1 (failures removed from data collection)
+# 3. Received treatment (some quit after att check 1 but before treatment)
+# 4. ITT = treated + passed attention check 2 (preregistered)
+# 5. Finished survey
+
+# Passed attention check 1
+d_passed_attn1 <- d_all |>
+ filter(attncheck1_passed)
+
+# Received treatment
+d_treated <- d_all |>
+ filter(treated)
+
+# ITT sample: treated AND passed attention check 2 (preregistered exclusion)
+d_itt <- d_treated |>
+ filter(attncheck2_passed)
+
+# Finished survey (final analysis sample)
+d <- d_itt |>
+ filter(Finished == "1")
+
+# Compute sample sizes at each stage
+n_all <- nrow(d_all)
+n_passed_attn1 <- nrow(d_passed_attn1)
+n_treated <- nrow(d_treated)
+n_itt <- nrow(d_itt)
+n_final <- nrow(d)
+
+# Create sample flow table
+sample_table <- tibble::tibble(
+ Stage = c(
+   "Started survey",
+   "Passed attention check 1",
+   "Received treatment",
+   "ITT (treated + passed attn check 2)",
+   "Finished survey"
+ ),
+ N = c(n_all, n_passed_attn1, n_treated, n_itt, n_final),
+ `% of Started` = sprintf("%.1f%%", 100 * N / n_all)
+)
+
+sample_table |>
+ gt::gt() |>
+ gt::tab_header(title = "Sample Flow") |>
+ gt::tab_footnote(
+   footnote = "Attention check 1 failures are removed from data collection. ITT excludes those who failed attention check 2 (preregistered)."
+ )
+```
+
+### Attention Check Breakdown
+
+- **Attention check 1**: Failures are removed from data collection entirely
+- **Attention check 2**: Pre-treatment; failures continue survey but are excluded from ITT
+
+```{r}
+#| label: attention-checks
+
+tibble(
+ Check = c("Attention Check 1", "Attention Check 2"),
+ Passed = c(
+   sum(d_all$attncheck1_passed, na.rm = TRUE),
+   sum(d_treated$attncheck2_passed, na.rm = TRUE)
+ ),
+ Failed = c(
+   sum(!d_all$attncheck1_passed, na.rm = TRUE),
+   sum(!d_treated$attncheck2_passed, na.rm = TRUE)
+ )
+) |>
+ gt::gt() |>
+ gt::tab_header(title = "Attention Check Results")
+```
+
+## Condition Balance
+
+```{r}
+#| label: condition-balance
+
+# Cross-tabulation by condition
+condition_table <- d |>
+ count(text, format) |>
+ pivot_wider(names_from = format, values_from = n, values_fill = 0) |>
+ mutate(Total = Full + Summary)
+
+condition_table |>
+ gt::gt() |>
+ gt::tab_header(title = "Sample Size by Condition (Final Sample)")
+
+# Chi-squared test for balance
+balance_matrix <- d |>
+ count(text, format) |>
+ pivot_wider(names_from = format, values_from = n, values_fill = 0) |>
+ column_to_rownames("text") |>
+ as.matrix()
+
+balance_test <- chisq.test(balance_matrix)
+
+cat(sprintf(
+ "\nChi-squared test for condition balance: χ²(%d) = %.2f, p = %.3f\n",
+ balance_test$parameter,
+ balance_test$statistic,
+ balance_test$p.value
+))
+```
+
+## Attrition Analysis
+
+Check whether attrition (from ITT to finishing) differs by condition.
+
+```{r}
+#| label: attrition-analysis
+
+# Attrition matrix: ITT vs finished by condition
+attrition_summary <- d_itt |>
+ group_by(condition) |>
+ summarise(
+   n_itt = n(),
+   n_finished = sum(Finished == "1", na.rm = TRUE),
+   n_dropped = n_itt - n_finished,
+   attrition_rate = sprintf("%.1f%%", 100 * n_dropped / n_itt),
+   .groups = "drop"
+ )
+
+attrition_summary |>
+ gt::gt() |>
+ gt::tab_header(title = "Attrition by Condition") |>
+ gt::cols_label(
+   condition = "Condition",
+   n_itt = "ITT Sample",
+   n_finished = "Finished",
+   n_dropped = "Dropped",
+   attrition_rate = "Attrition Rate"
+ )
+
+# Chi-squared test for differential attrition
+attrition_matrix <- d_itt |>
+ count(condition) |>
+ left_join(
+   d |> count(condition),
+   by = "condition",
+   suffix = c("_pre", "_post")
+ ) |>
+ mutate(n_post = replace_na(n_post, 0)) |>
+ transmute(
+   condition,
+   dropped = n_pre - n_post,
+   stayed = n_post
+ ) |>
+ column_to_rownames("condition") |>
+ as.matrix()
+
+attrition_test <- chisq.test(attrition_matrix)
+
+cat(sprintf(
+ "\nChi-squared test for differential attrition: χ²(%d) = %.2f, p = %.3f\n",
+ attrition_test$parameter,
+ attrition_test$statistic,
+ attrition_test$p.value
+))
+
+# if (attrition_test$p.value < 0.05) {
+#  cat("\n⚠️ Significant differential attrition detected. Consider Lee bounds for robustness.\n")
+# }
+```
+
+## Survey Completion Time
+
+```{r}
+#| label: timing-helper
+
+format_time <- function(seconds) {
+ hours <- floor(seconds / 3600)
+ mins <- floor((seconds %% 3600) / 60)
+ secs <- round(seconds %% 60)
+
+ if (hours > 0) {
+   sprintf("%dh %dm", hours, mins)
+ } else if (mins > 0) {
+   sprintf("%dm %ds", mins, secs)
+ } else {
+   sprintf("%ds", secs)
+ }
+}
+```
+   
+```{r}
+#| label: timing-summary
+
+# Summary statistics by text and format
+time_summary <- d |>
+ group_by(text, format) |>
+ summarise(
+   n = n(),
+   mean_sec = mean(text_total_time, na.rm = TRUE),
+   sd_sec = sd(text_total_time, na.rm = TRUE),
+   median_sec = median(text_total_time, na.rm = TRUE),
+   mean_clicks = mean(text_total_clicks, na.rm = TRUE),
+   .groups = "drop"
+ ) |>
+ mutate(
+   Time = sprintf("%s (%s)", sapply(mean_sec, format_time), sapply(sd_sec, format_time)),
+   Median = sapply(median_sec, format_time),
+   Clicks = sprintf("%.1f", mean_clicks)
+ ) |>
+ select(Text = text, Format = format, N = n, `Time M (SD)` = Time, `Time Mdn` = Median, `Clicks M` = Clicks)
+
+time_summary |>
+ knitr::kable(caption = "Reading time and clicks by condition")
+```
+
+```{r}
+#| label: timing-tests
+
+# t-tests comparing text conditions (pooled across format)
+ttest_time_text <- broom::tidy(t.test(text_total_time ~ text, data = d))
+ttest_clicks_text <- broom::tidy(t.test(text_total_clicks ~ text, data = d))
+
+# t-tests comparing format conditions (pooled across text)
+ttest_time_format <- broom::tidy(t.test(text_total_time ~ format, data = d))
+ttest_clicks_format <- broom::tidy(t.test(text_total_clicks ~ format, data = d))
+
+tibble(
+ Comparison = c("Lewis vs Haidt (time)", "Lewis vs Haidt (clicks)",
+                "Full vs Summary (time)", "Full vs Summary (clicks)"),
+ `t` = c(ttest_time_text$statistic, ttest_clicks_text$statistic,
+         ttest_time_format$statistic, ttest_clicks_format$statistic),
+ `df` = c(ttest_time_text$parameter, ttest_clicks_text$parameter,
+          ttest_time_format$parameter, ttest_clicks_format$parameter),
+ `p` = c(ttest_time_text$p.value, ttest_clicks_text$p.value,
+         ttest_time_format$p.value, ttest_clicks_format$p.value)
+) |>
+ knitr::kable(digits = 3, caption = "t-tests for reading time and clicks")
+```
+
+```{r}
+#| label: timing-histogram
+#| fig-cap: "Distribution of reading time by condition"
+#| fig-width: 8
+#| fig-height: 5
+
+d <- d |>
+ mutate(text_total_time_min = text_total_time / 60)
+
+ggplot(d, aes(x = text_total_time_min, fill = format)) +
+ geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+ facet_grid(text ~ format) +
+ labs(
+   x = "Total reading time (minutes)",
+   y = "Count",
+   fill = "Format"
+ ) +
+ theme_bw() +
+ theme(legend.position = "none")
+```
+
+# Preregistered Main Analysis
+
+## Analysis Functions
+
+```{r}
+#| label: analysis-functions
+
+# Full 2x2 analysis function (text * format * pre_score)
+# Per preregistration: treatment coding for text, effect coding for format, z-scored pre_score
+persuasion_analysis <- function(
+ change_dv,
+ pre_dv,
+ data,
+ label,
+ text_treatment = "Lewis"
+) {
+
+ # Step 1: t-tests for pre-post change in each 2x2 cell
+ t_tests <- data %>%
+   dplyr::group_by(text, format) %>%
+   rstatix::t_test(as.formula(paste(change_dv, "~ 1")), mu = 0, alternative = "two.sided") %>%
+   rstatix::add_significance() %>%
+   dplyr::ungroup()
+
+ # Set up coding per preregistration
+ data_model <- data %>%
+   dplyr::mutate(
+     # Treatment coding for text (1 = treatment, 0 = control)
+     text_treat = ifelse(text == text_treatment, 1, 0),
+     # Effect coding for format (-0.5 = Full, 0.5 = Summary)
+     format_eff = ifelse(format == "Full", -0.5, 0.5),
+     # Z-scored pre-treatment measure
+     pre_score_z = scale(.data[[pre_dv]])[, 1]
+   )
+
+ # Fit model: change_score ~ text * format * pre_score (preregistered specification)
+ formula_str <- paste0(change_dv, " ~ text_treat * format_eff * pre_score_z")
+ mod <- estimatr::lm_robust(as.formula(formula_str), data = data_model)
+ lm_mod <- stats::lm(as.formula(formula_str), data = data_model)
+
+ # Extract coefficients
+ coefs <- broom::tidy(mod, conf.int = TRUE)
+ text_coef <- coefs %>% filter(term == "text_treat")
+ interaction_coef <- coefs %>% filter(term == "text_treat:format_eff")
+
+ # Format-specific contrasts if interaction is significant
+ contrasts_by_format <- NULL
+ if (nrow(interaction_coef) > 0 && !is.na(interaction_coef$p.value) && interaction_coef$p.value < 0.05) {
+   contrasts_by_format <- marginaleffects::avg_comparisons(
+     lm_mod,
+     variables = "text_treat",
+     by = "format_eff",
+     newdata = "balanced",
+     vcov = "HC2"
+   )
+ }
+
+ # Predictions by condition
+ preds <- tryCatch(
+   marginaleffects::predictions(
+     lm_mod,
+     by = c("text_treat", "format_eff"),
+     newdata = "balanced",
+     vcov = "HC2"
+   ),
+   error = function(e) NULL
+ )
+
+ # ATE (text effect averaged across format)
+ ate <- marginaleffects::avg_comparisons(
+   lm_mod,
+   variables = "text_treat",
+   newdata = "balanced",
+   vcov = "HC2"
+ )
+
+ # Pooled SD for standardized effect size
+ pooled_sd <- stats::sd(data[[change_dv]], na.rm = TRUE)
+
+ # Standardized effect size
+ std_ate <- text_coef$estimate / pooled_sd
+
+ # Plot: empirical means by condition
+ emp_summary <- data %>%
+   dplyr::group_by(text, format) %>%
+   dplyr::summarise(
+     n = dplyr::n(),
+     mean = mean(.data[[change_dv]], na.rm = TRUE),
+     se = stats::sd(.data[[change_dv]], na.rm = TRUE) / sqrt(n),
+     ci95 = 1.96 * se,
+     lo = mean - ci95,
+     hi = mean + ci95,
+     .groups = "drop"
+   )
+
+ emp_plot <- ggplot2::ggplot(emp_summary) +
+   ggplot2::geom_linerange(
+     ggplot2::aes(x = format, ymin = lo, ymax = hi, color = text),
+     position = ggplot2::position_dodge(width = 0.5),
+     linewidth = 0.7
+   ) +
+   ggplot2::geom_point(
+     ggplot2::aes(x = format, y = mean, color = text),
+     position = ggplot2::position_dodge(width = 0.5),
+     size = 2.2
+   ) +
+   ggplot2::geom_hline(yintercept = 0, linetype = "dashed") +
+   ggplot2::labs(
+     title = paste0("Change scores: ", label),
+     x = "Format",
+     y = "Change Score",
+     color = "Text"
+   ) +
+   ggplot2::theme_bw()
+
+ list(
+   t_tests = t_tests,
+   model = mod,
+   lm_model = lm_mod,
+   coefs = coefs,
+   text_coef = text_coef,
+   interaction_coef = interaction_coef,
+   contrasts_by_format = contrasts_by_format,
+   predictions = preds,
+   ate = ate,
+   pooled_sd = pooled_sd,
+   std_ate = std_ate,
+   empirical_summary = emp_summary,
+   empirical_plot = emp_plot
+ )
+}
+```
+
+## IRS/Federal Worker Attitudes
+
+For these analyses, Lewis text (federal workers) is the treatment, Haidt text (happiness) is the control.
+
+### Run Analyses
+
+```{r}
+#| label: irs-analyses
+
+# IRS approval composite
+irs_approval <- persuasion_analysis(
+ change_dv = "irs_approval_change",
+ pre_dv = "irs_approval_pre",
+ data = d,
+ label = "IRS Approval Composite",
+ text_treatment = "Lewis"
+)
+
+# Civil service approval composite
+civil_service <- persuasion_analysis(
+ change_dv = "civil_service_change",
+ pre_dv = "civil_service_pre",
+ data = d,
+ label = "Civil Service Approval Composite",
+ text_treatment = "Lewis"
+)
+
+# Approval of IRS workforce cuts (DOGE)
+doge_approval <- persuasion_analysis(
+ change_dv = "doge_change",
+ pre_dv = "doge_pre_1",
+ data = d,
+ label = "Approval of DOGE/IRS Workforce Cuts",
+ text_treatment = "Lewis"
+)
+
+# Approval of Trump administration
+trump_approval <- persuasion_analysis(
+ change_dv = "trump_change",
+ pre_dv = "trump_pre_1",
+ data = d,
+ label = "Approval of Trump Administration",
+ text_treatment = "Lewis"
+)
+
+# Opinion on IRS enforcement/resources
+irs_enforce <- persuasion_analysis(
+ change_dv = "enforce_change",
+ pre_dv = "enforce_pre_1",
+ data = d,
+ label = "Opinion on IRS Enforcement",
+ text_treatment = "Lewis"
+)
+
+# SSA agents favorability
+fav_ssa <- persuasion_analysis(
+ change_dv = "fav_ssa_change",
+ pre_dv = "fav_ssa_pre_1",
+ data = d,
+ label = "Favorability of SSA Agents",
+ text_treatment = "Lewis"
+)
+```
+
+## Material Values Scale
+
+For this analysis, Haidt text (happiness) is the treatment, Lewis text (federal workers) is the control.
+
+```{r}
+#| label: mvs-analysis
+
+mvs <- persuasion_analysis(
+ change_dv = "mvs_change",
+ pre_dv = "mvs_pre",
+ data = d,
+ label = "Material Values Scale",
+ text_treatment = "Haidt"
+)
+```
+
+## Results
+
+### Step 1: T-tests for Pre-Post Change
+
+Two-tailed t-tests to determine whether each DV change (post - pre) differs from 0, separately in each 2x2 cell.
+
+```{r}
+#| label: ttest-results
+
+# Collect all analyses
+all_analyses <- list(
+ irs_approval, civil_service, doge_approval, trump_approval, irs_enforce, fav_ssa, mvs
+)
+
+all_labels <- c(
+ "IRS Approval Composite",
+ "Civil Service Composite",
+ "DOGE/IRS Workforce Cuts",
+ "Trump Administration",
+ "IRS Enforcement",
+ "SSA Agents Favorability",
+ "Material Values Scale"
+)
+
+# Combine all t-test results
+combined_ttests <- purrr::map2_dfr(all_analyses, all_labels, ~ {
+ .x$t_tests |>
+   mutate(DV = .y) |>
+   select(DV, text, format, n, statistic, df, p, p.signif)
+})
+
+# Display table
+combined_ttests |>
+ mutate(
+   Condition = paste(text, format, sep = "_"),
+   `t (sig)` = sprintf("%.2f %s", statistic, p.signif)
+ ) |>
+ select(DV, Condition, n, `t (sig)`, p) |>
+ pivot_wider(
+   id_cols = DV,
+   names_from = Condition,
+   values_from = c(n, `t (sig)`)
+ ) |>
+ gt::gt() |>
+ gt::tab_header(title = "T-tests for Pre-Post Change by Condition") |>
+ gt::fmt_number(columns = starts_with("p"), decimals = 3)
+```
+
+### Step 2: ATE Estimation
+
+Model specification per preregistration: `change_score ~ text * format * pre_score`
+
+- **text coefficient**: ATE of persuasive text, averaged across format
+- **text:format interaction**: Difference in treatment effect between Full and Summary
+
+```{r}
+#| label: ate-results
+
+# Function to create ATE summary table
+make_ate_table <- function(analyses, labels) {
+ sigstars <- function(p) {
+   ifelse(is.na(p), "",
+          ifelse(p < 0.001, "***",
+                 ifelse(p < 0.01, "**",
+                        ifelse(p < 0.05, "*",
+                               ifelse(p < 0.1, ".", "")))))
+ }
+
+ results <- purrr::map2_dfr(analyses, labels, ~ {
+   # Text effect (main ATE)
+   text_row <- tibble(
+     DV = .y,
+     Effect = "Text (ATE)",
+     Estimate = .x$text_coef$estimate,
+     SE = .x$text_coef$std.error,
+     p = .x$text_coef$p.value,
+     CI_low = .x$text_coef$conf.low,
+     CI_high = .x$text_coef$conf.high,
+     std_ate = .x$std_ate
+   )
+
+   # Interaction effect
+   int_row <- NULL
+   if (nrow(.x$interaction_coef) > 0) {
+     int_row <- tibble(
+       DV = .y,
+       Effect = "Text x Format",
+       Estimate = .x$interaction_coef$estimate,
+       SE = .x$interaction_coef$std.error,
+       p = .x$interaction_coef$p.value,
+       CI_low = .x$interaction_coef$conf.low,
+       CI_high = .x$interaction_coef$conf.high,
+       std_ate = NA_real_
+     )
+   }
+
+   bind_rows(text_row, int_row)
+ }) %>%
+   mutate(
+     Est_formatted = sprintf("%.3f (%.3f)%s", Estimate, SE, sigstars(p)),
+     CI_formatted = sprintf("[%.3f, %.3f]", CI_low, CI_high),
+     std_ate_formatted = ifelse(is.na(std_ate), "-", sprintf("%.3f", std_ate))
+   ) %>%
+   select(DV, Effect, Est_formatted, std_ate_formatted, CI_formatted, p)
+
+ results %>%
+   gt() %>%
+   cols_label(
+     Est_formatted = "Estimate (SE)",
+     std_ate_formatted = "Std. Effect",
+     CI_formatted = "95% CI",
+     p = "p-value"
+   ) %>%
+   fmt_number(columns = p, decimals = 3) %>%
+   tab_footnote(
+     footnote = ". p < .10, * p < .05, ** p < .01, *** p < .001. Std. Effect = ATE / pooled SD."
+   )
+}
+
+# IRS/Federal Worker DVs (Lewis = treatment)
+irs_analyses <- list(irs_approval, civil_service, doge_approval, trump_approval, irs_enforce, fav_ssa)
+
+irs_labels <- c(
+ "IRS Approval Composite",
+ "Civil Service Composite",
+ "DOGE/IRS Workforce Cuts",
+ "Trump Administration",
+ "IRS Enforcement",
+ "SSA Agents Favorability"
+)
+
+cat("### Federal Worker Text Effects (Lewis = Treatment)\n")
+make_ate_table(irs_analyses, irs_labels)
+```
+
+```{r}
+#| label: mvs-ate-results
+
+cat("### Happiness Text Effects (Haidt = Treatment)\n")
+make_ate_table(list(mvs), "Material Values Scale")
+```
+
+### Visualization
+
+Empirical means with 95% CIs for each outcome measure by condition.
+
+```{r}
+#| label: plots-irs
+#| fig-width: 8
+#| fig-height: 10
+
+# IRS-related outcomes
+(irs_approval$empirical_plot + civil_service$empirical_plot) /
+ (doge_approval$empirical_plot + trump_approval$empirical_plot) /
+ (irs_enforce$empirical_plot + fav_ssa$empirical_plot)
+```
+
+```{r}
+#| label: plots-mvs
+#| fig-width: 5
+#| fig-height: 3.5
+
+# Material Values Scale
+mvs$empirical_plot
+```
+
+## Format-Specific Contrasts
+
+If any text x format interaction is significant (p < .05), we show the format-specific treatment effects.
+
+```{r}
+#| label: format-contrasts
+
+# Check for significant interactions and display contrasts
+sig_interactions <- purrr::map2(all_analyses, all_labels, ~ {
+ if (!is.null(.x$contrasts_by_format)) {
+   list(label = .y, contrasts = .x$contrasts_by_format)
+ } else {
+   NULL
+ }
+}) %>%
+ purrr::compact()
+
+if (length(sig_interactions) > 0) {
+ cat("Significant text x format interactions detected:\n\n")
+ for (item in sig_interactions) {
+   cat(sprintf("### %s\n", item$label))
+   print(item$contrasts)
+   cat("\n")
+ }
+} else {
+ cat("No significant text x format interactions detected (all p >= .05).\n")
+ cat("Treatment effects do not significantly differ between Full and Summary formats.\n")
+}
+```
